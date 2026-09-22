@@ -443,6 +443,18 @@ func (p *Plugin) Uninstall(ctx context.Context, config config.IConfig, fs afero.
 		return err
 	}
 
+	// Last, and deliberately not part of the rollback above. The stamp only rations how
+	// often the CLI asks about upgrades, so an uninstall that has already removed the
+	// binary and the metadata has succeeded whether or not this cache goes with it --
+	// and putting a whole uninstall back because a timestamp would not delete would be
+	// far worse than leaving the timestamp.
+	if err := removeAutoUpgradeCheckStamp(config, fs, p.Shortname); err != nil {
+		log.WithFields(log.Fields{
+			"prefix": "plugins.plugin.Uninstall",
+			"plugin": p.Shortname,
+		}).Debugf("could not remove the upgrade check stamp: %s", err)
+	}
+
 	return nil
 }
 
@@ -650,9 +662,32 @@ func (p *Plugin) Run(ctx context.Context, config *config.Config, fs afero.Fs, ar
 	return p.run(ctx, config, fs, args, cwd, versionOverride, apiBaseURL, dashboardBaseURL, accessBaseURL, true)
 }
 
-// run is Run with the auto-upgrade check made optional, so that the one caller who
-// reaches a plugin without the user having asked for it can leave it out. See
-// CoreCLIHelper.RunPeerPlugin.
+// RunWithoutAutoUpgrade is Run for a handoff that should not spend a metadata request
+// on the auto-upgrade check. Two callers want this, for different reasons:
+//
+// Printing the plugin's own help, which the CLI hands to the plugin because the plugin
+// owns that text rather than the manifest. `--help` is a question about a command, and
+// answering it should not download and install software: someone reading help is usually
+// deciding whether to run something, or has just been told they got the flags wrong, and
+// neither is a moment for an upgrade they did not ask for.
+//
+// Running a plugin that was installed earlier in this same invocation, where the install
+// already resolved the newest release -- so a check here would spend a second request to
+// be told what the first one just said. This mirrors what run's own auto-install branch
+// does when the install happens inside it.
+//
+// Either way the upgrade is deferred, not lost: the next command that does real work on
+// an already-installed plugin makes the check.
+//
+// An install still happens here when the binary is missing, since there is nowhere else
+// for the plugin or its help text to come from.
+func (p *Plugin) RunWithoutAutoUpgrade(ctx context.Context, config *config.Config, fs afero.Fs, args []string, cwd string, versionOverride string, apiBaseURL, dashboardBaseURL, accessBaseURL string) error {
+	return p.run(ctx, config, fs, args, cwd, versionOverride, apiBaseURL, dashboardBaseURL, accessBaseURL, false)
+}
+
+// run is Run with the auto-upgrade check made optional, so that callers with nothing to
+// gain from it can leave it out. See CoreCLIHelper.RunPeerPlugin and
+// RunWithoutAutoUpgrade.
 func (p *Plugin) run(ctx context.Context, config *config.Config, fs afero.Fs, args []string, cwd string, versionOverride string, apiBaseURL, dashboardBaseURL, accessBaseURL string, allowAutoUpgrade bool) error {
 	logger := log.WithFields(log.Fields{
 		"prefix": "plugins.plugin.Run",
@@ -726,17 +761,17 @@ func (p *Plugin) run(ctx context.Context, config *config.Config, fs afero.Fs, ar
 	case Dispatcher:
 		logger.Debug("negotiated net/rpc with plugin process")
 		if _, err = d.RunCommand(args); err != nil {
-			return err
+			return pluginReportedError{err}
 		}
 	case DispatcherGRPC:
 		logger.Debug("negotiated gRPC with plugin process")
 		if err = d.RunCommand(buildAdditionalInfo(logger, apiBaseURL, dashboardBaseURL, accessBaseURL), args); err != nil {
-			return err
+			return pluginReportedError{err}
 		}
 	case DispatcherV3:
 		logger.Debug("negotiated gRPC with plugin process (v3)")
 		if err = d.RunCommand(buildAdditionalInfo(logger, apiBaseURL, dashboardBaseURL, accessBaseURL), args, NewCoreCLIHelper(ctx, config, fs, apiBaseURL, dashboardBaseURL, accessBaseURL)); err != nil {
-			return err
+			return pluginReportedError{err}
 		}
 	default:
 		return errorcategory.New(errorcategory.Internal, "dispensed an unknown plugin interface")

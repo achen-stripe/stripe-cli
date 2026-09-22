@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/spf13/afero"
@@ -862,9 +863,15 @@ func setUpRunAutoUpgrade(t *testing.T, installedVersion string) (*autoUpgradeStu
 	cfg := &TestConfig{}
 	cfg.InitConfig()
 
-	t.Setenv("STRIPE_PLUGINS_PATH", "/plugins")
+	// Run takes a *config.Config, so TestConfig's "/" config folder does not apply inside
+	// it and the plugins directory has to be moved onto the memory filesystem some other
+	// way. XDG_CONFIG_HOME rather than STRIPE_PLUGINS_PATH: the latter is an overridden
+	// plugins directory, which maybeAutoUpgrade now refuses to install into, so every
+	// test here would pass for the wrong reason. This moves the whole config folder,
+	// which is what a real machine does too.
+	t.Setenv("XDG_CONFIG_HOME", "/xdg")
 
-	installDir := filepath.Join("/plugins/appA", installedVersion)
+	installDir := filepath.Join(getPluginsDir(&cfg.Config), "appA", installedVersion)
 	require.NoError(t, fs.MkdirAll(installDir, 0755))
 	require.NoError(t, afero.WriteFile(fs, filepath.Join(installDir, "stripe-cli-app-a"+GetBinaryExtension()), []byte("bin"), 0755))
 
@@ -931,6 +938,22 @@ func TestRunSkipsAutoUpgradeForLocalDevelopmentBuild(t *testing.T) {
 	// away the thing they are working on. Two things stop that -- the switch branch
 	// this takes has no upgrade check, and maybeAutoUpgrade refuses on PluginsPath
 	// regardless -- so this asserts the outcome rather than either mechanism.
+	require.Empty(t, stubs.settingReads)
+	require.Empty(t, stubs.resolveCalls)
+	require.Empty(t, stubs.installCalls)
+}
+
+func TestRunWithoutAutoUpgradeSkipsTheCheck(t *testing.T) {
+	stubs, cfg, fs := setUpRunAutoUpgrade(t, "1.0.1")
+
+	plugin, err := LookUpPlugin(context.Background(), cfg, fs, "appA")
+	require.NoError(t, err)
+
+	require.Error(t, plugin.RunWithoutAutoUpgrade(context.Background(), &cfg.Config, fs, []string{"--help"}, "", "", "", "", ""))
+
+	// Not even the setting is read. Both callers of this reach a plugin with nothing to
+	// gain from the check -- printing help, or running something whose install just
+	// resolved the newest release -- so neither should pay a request for it.
 	require.Empty(t, stubs.settingReads)
 	require.Empty(t, stubs.resolveCalls)
 	require.Empty(t, stubs.installCalls)
@@ -1192,6 +1215,53 @@ func TestUninstallSucceedsWithLocalMetadataOnly(t *testing.T) {
 	require.False(t, dirExists)
 
 	require.Equal(t, 0, len(config.GetInstalledPlugins()))
+}
+
+// The check stamp is the one piece of per-plugin state that does not live in the
+// metadata file or the plugin directory, so nothing else in Uninstall reaches it.
+func TestUninstallRemovesTheAutoUpgradeCheckStamp(t *testing.T) {
+	fs := afero.NewMemMapFs()
+	config := &TestConfig{}
+	config.InitConfig()
+	plugin := Plugin{
+		Shortname:        "sample-plugin",
+		Binary:           "stripe-cli-sample-plugin",
+		MagicCookieValue: "SAMPLE-COOKIE",
+		Releases: []Release{
+			{Arch: runtime.GOARCH, OS: runtime.GOOS, Version: "1.0.0", Sum: "abc123"},
+		},
+	}
+
+	require.NoError(t, writeLocalPluginMetadata(config, fs, plugin))
+	require.NoError(t, fs.MkdirAll("/plugins/sample-plugin/1.0.0", 0755))
+	writeAutoUpgradeCheckStamp(t, config, fs, "sample-plugin", time.Now())
+	require.True(t, autoUpgradeCheckStampExists(t, config, fs, "sample-plugin"))
+
+	require.NoError(t, plugin.Uninstall(context.Background(), config, fs))
+
+	require.False(t, autoUpgradeCheckStampExists(t, config, fs, "sample-plugin"))
+}
+
+// The ordinary case, since auto-update is off by default: there is no stamp to remove,
+// and an uninstall must not report that as a problem.
+func TestUninstallSucceedsWithoutAnAutoUpgradeCheckStamp(t *testing.T) {
+	fs := afero.NewMemMapFs()
+	config := &TestConfig{}
+	config.InitConfig()
+	plugin := Plugin{
+		Shortname:        "sample-plugin",
+		Binary:           "stripe-cli-sample-plugin",
+		MagicCookieValue: "SAMPLE-COOKIE",
+		Releases: []Release{
+			{Arch: runtime.GOARCH, OS: runtime.GOOS, Version: "1.0.0", Sum: "abc123"},
+		},
+	}
+
+	require.NoError(t, writeLocalPluginMetadata(config, fs, plugin))
+	require.NoError(t, fs.MkdirAll("/plugins/sample-plugin/1.0.0", 0755))
+	require.False(t, autoUpgradeCheckStampExists(t, config, fs, "sample-plugin"))
+
+	require.NoError(t, plugin.Uninstall(context.Background(), config, fs))
 }
 
 func TestUninstallRejectsInvalidPluginShortnames(t *testing.T) {
